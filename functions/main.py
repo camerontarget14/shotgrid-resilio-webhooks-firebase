@@ -58,18 +58,28 @@ logger.info(f"Using script name: {SG_SCRIPT_NAME}")
 
 
 # ─────────────────────────────── Singleton SG client ────────────────────────
-logger.info("Initializing ShotGrid client connection")
-try:
-    _SG_CLIENT = shotgun_api3.Shotgun(
-        SG_HOST,
-        script_name=SG_SCRIPT_NAME,
-        api_key=SG_API_KEY,
-        connect=True,
-    )
-    logger.info("ShotGrid client connection successful")
-except Exception as e:
-    logger.error(f"Failed to initialize ShotGrid client: {str(e)}")
-    raise
+logger.info("Preparing ShotGrid client configuration (lazy connection)")
+
+_SG_CLIENT = None
+
+def get_sg_client():
+    """Get or create the ShotGrid client with lazy initialization"""
+    global _SG_CLIENT
+    if _SG_CLIENT is None:
+        try:
+            logger.info("Initializing ShotGrid client connection")
+            _SG_CLIENT = shotgun_api3.Shotgun(
+                SG_HOST,
+                script_name=SG_SCRIPT_NAME,
+                api_key=SG_API_KEY,
+                connect=False,  # Don't connect immediately
+            )
+            logger.info("ShotGrid client initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize ShotGrid client: {str(e)}")
+            raise
+    return _SG_CLIENT
+
 
 # ─────────────────────────────── ShotGrid helper ────────────────────────────
 class SG:

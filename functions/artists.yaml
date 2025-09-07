@@ -3,8 +3,8 @@
 
 artists:
   # Maps ShotGrid artist names to Resilio agent names
-  Matthew: Linux_02
-  Alex: Linux_03
+  Galactus: Linux_02
+  Doom: Linux_03
 
 # Path templates for hybrid work jobs
 paths:
@@ -30,7 +30,7 @@ sync_settings:
   active_shot_status: "active"
 
   # Whether to delete jobs for shots that are no longer active
-  cleanup_inactive_jobs: false
+  cleanup_inactive_jobs: true
 
   # Maximum files to hydrate per request
   max_hydrate_files: 1000
