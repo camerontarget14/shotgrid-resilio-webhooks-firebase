@@ -61,52 +61,79 @@ class ResilioStateAPI(ApiBaseCommands):
         except ApiError:
             return None
 
-    def create_hybrid_work_job(self, name: str, agent_id: int, path: str,
-                              description: str = "") -> Dict[str, Any]:
-        """Create a hybrid work job for a single agent."""
+    def create_hybrid_work_job(self, name: str, primary_storage_agent_id: str, primary_storage_path: str,
+                              target_agent_id: str, target_agent_path: str, description: str = "") -> Dict[str, Any]:
+        """Create a hybrid work job with specific paths for primary and target storage."""
         try:
             job_attrs = {
                 'name': name,
-                'type': 'hybrid_work',  # Assuming this is the correct type
+                'type': 'hybrid_work',
                 'description': description,
-                'groups': [{
-                    'id': None,  # Will be auto-created
-                    'agents': [{'id': agent_id}],
-                    'path': {
-                        'linux': path,
-                        'win': path.replace('/', '\\'),
-                        'osx': path
+                'agents': [
+                    {
+                        'id': primary_storage_agent_id,  # Remove int() conversion
+                        'role': 'primary_storage',
+                        'permission': 'rw',
+                        'priority_agents': True,
+                        'path': {
+                            'linux': primary_storage_path,
+                            'win': primary_storage_path.replace('/', '\\'),
+                            'osx': primary_storage_path
+                        }
                     },
-                    'permission': 'rw'
-                }]
+                    {
+                        'id': target_agent_id,  # Remove int() conversion
+                        'role': 'enduser',
+                        'permission': 'srw',
+                        'file_policy_id': 1,
+                        'path': {
+                            'linux': target_agent_path,
+                            'win': target_agent_path.replace('/', '\\'),
+                            'osx': target_agent_path
+                        }
+                    }
+                ]
             }
 
-            job_id = self._create_job(job_attrs)
-            return {'id': job_id, 'name': name, 'path': path}
+            job_id = self._create_job(job_attrs, ignore_errors=True)
+            return {'id': job_id, 'name': name}
 
         except ApiError as e:
             raise ApiError(f"Failed to create hybrid work job '{name}': {e}")
 
-    def update_job_path(self, job_id: int, new_path: str):
-        """Update the path for an existing job."""
+
+    def update_hybrid_work_job_paths(self, job_id: int, primary_storage_path: str, target_agent_path: str):
+        """Update the paths for an existing hybrid work job."""
         try:
             # Get current job configuration
             job = self._get_job(job_id)
-            groups = job.get('groups', [])
 
-            # Update the path for all groups
-            for group in groups:
-                if group.get('path'):
-                    group['path'] = {
-                        'linux': new_path,
-                        'win': new_path.replace('/', '\\'),
-                        'osx': new_path
-                    }
+            # Remove read-only properties that cause API errors
+            read_only_props = ['total_transferred', 'created_at', 'created_by', 'last_start_time', 'errors', 'access', 'notifications']
+            for prop in read_only_props:
+                job.pop(prop, None)
 
-            self._update_job(job_id, {'groups': groups})
+            # Update agent paths in the agents array
+            if 'agents' in job:
+                for agent in job['agents']:
+                    if agent.get('role') == 'primary_storage':
+                        agent['path'] = {
+                            'linux': primary_storage_path,
+                            'win': primary_storage_path.replace('/', '\\'),
+                            'osx': primary_storage_path
+                        }
+                    elif agent.get('role') == 'enduser':
+                        agent['path'] = {
+                            'linux': target_agent_path,
+                            'win': target_agent_path.replace('/', '\\'),
+                            'osx': target_agent_path
+                        }
+
+            self._update_job(job_id, job)
 
         except ApiError as e:
-            raise ApiError(f"Failed to update job {job_id} path: {e}")
+            raise ApiError(f"Failed to update job {job_id} paths: {e}")
+
 
     def hydrate_files(self, run_id: int, files: List[str],
                      agents: Optional[List[int]] = None) -> Dict[str, Any]:
@@ -177,27 +204,69 @@ class ShotGridStateManager:
         """
         try:
             # Get all active shots
+            # Get all active shots
             active_shots = self.sg.find(
                 "Shot",
                 [["sg_status_list", "is", "active"]],
-                ["id", "code", "project", "tasks"]
+                ["id", "code", "project", "tank_name", "sg_sequence", "tasks"]  # Add sg_sequence
             )
+
+            # Debug: Check the specific shot that triggered this
+            debug_shot = self.sg.find_one(
+                "Shot",
+                [["id", "is", 1213]],
+                ["id", "code", "sg_status_list", "project.Project.tank_name", "project"]
+            )
+            logger.info(f"Debug shot 1213: {debug_shot}")
+
+            # Debug: Check if we found any active shots at all
+            logger.info(f"Active shots query returned {len(active_shots)} shots")
+            if active_shots:
+                for shot in active_shots[:3]:  # Log first 3 shots
+                    logger.info(f"Active shot found: ID={shot.get('id')}, code={shot.get('code')}, status={shot.get('sg_status_list')}")
+
 
             shots_data = []
             artist_projects = {}
 
             for shot in active_shots:
                 project = shot.get("project", {})
+                project_id = project.get("id")
                 project_name = project.get("name", "")
-                tank_name = project.get("tank_name", "")
+
+                # Fetch full project details including tank_name
+                tank_name = ""
+                if project_id:
+                    try:
+                        full_project = self.sg.find_one(
+                            "Project",
+                            [["id", "is", project_id]],
+                            ["name", "tank_name"]
+                        )
+                        if full_project:
+                            tank_name = full_project.get("tank_name", "")
+                            if not project_name:  # Use project name from full fetch if missing
+                                project_name = full_project.get("name", "")
+                    except Exception as e:
+                        logger.warning(f"Failed to fetch project details for project {project_id}: {e}")
 
                 if not tank_name:
-                    logger.warning(f"Shot {shot['code']} project has no tank_name, skipping")
+                    logger.warning(f"Shot {shot['code']} project '{project_name}' has no tank_name, skipping")
                     continue
 
-                # Extract sequence from shot code (TST_010_0010 -> TST_010)
+                logger.info(f"Processing shot {shot['code']} with tank_name: {tank_name}")
+
+                # NEW CODE - Use ShotGrid sequence field instead of parsing shot code
                 shot_code = shot.get("code", "")
-                sequence = "_".join(shot_code.split("_")[:2]) if "_" in shot_code else shot_code
+
+                # Get the actual sequence from ShotGrid
+                sg_sequence = shot.get("sg_sequence", {})
+                if sg_sequence and isinstance(sg_sequence, dict):
+                    sequence = sg_sequence.get("name", "VFX")
+                else:
+                    sequence = "VFX"  # Default fallback
+
+                logger.info(f"Shot {shot_code} is in sequence: {sequence}")
 
                 # Get tasks for this shot to find assigned artists
                 tasks = self.sg.find(
@@ -258,29 +327,72 @@ class ResilioStateSyncManager:
         with open(self.config_path, "r", encoding="utf-8") as f:
             return yaml.safe_load(f) or {}
 
-    def get_artist_agent_mapping(self) -> Dict[str, str]:
-        """Get mapping of artist names to agent names from config."""
-        return self.config.get("artists", {})
+    def build_primary_storage_path(self, project_tank_name: str, sequence: str, shot_name: str) -> str:
+        """Build full path for primary storage."""
+        primary_base = self.config.get("primary_storage", {}).get("base_path", "")
+        template = self.config.get("path_templates", {}).get("shots_template", "")
 
-    def get_base_paths(self) -> Dict[str, str]:
-        """Get base path templates from config."""
-        paths = self.config.get("paths", {})
-        return {
-            'shots': paths.get('shots_template', '/Volumes/Company/${PROJECT}/2_WORK/1_SEQUENCES/${SEQUENCE}/${SHOT}'),
-            'assets': paths.get('assets_template', '/Volumes/Company/${PROJECT}/2_WORK/2_ASSETS')
-        }
+        relative_path = template.replace('${PROJECT}', project_tank_name) \
+                              .replace('${SEQUENCE}', sequence) \
+                              .replace('${SHOT}', shot_name)
 
-    def build_shot_path(self, project_tank_name: str, sequence: str, shot_name: str) -> str:
-        """Build full path for a shot."""
-        template = self.get_base_paths()['shots']
-        return template.replace('${PROJECT}', project_tank_name) \
-                      .replace('${SEQUENCE}', sequence) \
-                      .replace('${SHOT}', shot_name)
+        return f"{primary_base}/{relative_path}"
 
-    def build_assets_path(self, project_tank_name: str) -> str:
-        """Build full path for project assets."""
-        template = self.get_base_paths()['assets']
-        return template.replace('${PROJECT}', project_tank_name)
+    def build_target_agent_path(self, artist: str, project_tank_name: str, sequence: str, shot_name: str) -> str:
+        """Build full path for target agent."""
+        target_config = self.config.get("target_agents", {}).get(artist, {})
+        target_base = target_config.get("base_path", "")
+        template = self.config.get("path_templates", {}).get("shots_template", "")
+
+        relative_path = template.replace('${PROJECT}', project_tank_name) \
+                              .replace('${SEQUENCE}', sequence) \
+                              .replace('${SHOT}', shot_name)
+
+        return f"{target_base}/{relative_path}"
+
+    def build_primary_assets_path(self, project_tank_name: str) -> str:
+        """Build full path for project assets on primary storage."""
+        primary_base = self.config.get("primary_storage", {}).get("base_path", "")
+        template = self.config.get("path_templates", {}).get("assets_template", "")
+
+        relative_path = template.replace('${PROJECT}', project_tank_name)
+        return f"{primary_base}/{relative_path}"
+
+    def build_target_assets_path(self, artist: str, project_tank_name: str) -> str:
+        """Build full path for project assets on target agent."""
+        target_config = self.config.get("target_agents", {}).get(artist, {})
+        target_base = target_config.get("base_path", "")
+        template = self.config.get("path_templates", {}).get("assets_template", "")
+
+        relative_path = template.replace('${PROJECT}', project_tank_name)
+        return f"{target_base}/{relative_path}"
+
+    def get_primary_storage_agent_id(self, api: ResilioStateAPI) -> str:
+        """Get the primary storage agent ID."""
+        primary_agent_id = self.config.get("primary_storage", {}).get("agent_id", "")
+        if primary_agent_id:
+            return primary_agent_id
+
+        # Fallback to name lookup if ID not configured
+        primary_agent_name = self.config.get("primary_storage", {}).get("agent_name", "")
+        agent = api.find_agent_by_name(primary_agent_name)
+        if not agent:
+            raise ApiError(f"Primary storage agent '{primary_agent_name}' not found")
+        return agent['id']
+
+    def get_target_agent_id(self, api: ResilioStateAPI, artist: str) -> str:
+        """Get the target agent ID for an artist."""
+        target_config = self.config.get("target_agents", {}).get(artist, {})
+        agent_id = target_config.get("agent_id", "")
+        if agent_id:
+            return agent_id
+
+        # Fallback to name lookup if ID not configured
+        agent_name = target_config.get("agent_name", "")
+        agent = api.find_agent_by_name(agent_name)
+        if not agent:
+            raise ApiError(f"Target agent '{agent_name}' for artist '{artist}' not found")
+        return agent['id']
 
     def generate_job_names(self, artist: str, project: str, shot: str = None) -> str:
         """Generate standardized job names."""
@@ -303,7 +415,21 @@ class ResilioStateSyncManager:
             Sync results summary
         """
         api = ResilioStateAPI(resilio_url, resilio_token, verify=False)
-        artist_agents = self.get_artist_agent_mapping()
+
+        # Get primary storage agent ID once
+        try:
+            primary_storage_agent_id = self.get_primary_storage_agent_id(api)
+        except ApiError as e:
+            return {
+                'shot_jobs_created': 0,
+                'shot_jobs_updated': 0,
+                'shot_jobs_hydrated': 0,
+                'assets_jobs_created': 0,
+                'assets_jobs_updated': 0,
+                'artists_processed': 0,
+                'errors': [f"Failed to get primary storage agent: {e}"],
+                'details': []
+            }
 
         results = {
             'shot_jobs_created': 0,
@@ -316,140 +442,195 @@ class ResilioStateSyncManager:
             'details': []
         }
 
-        # Process shot-specific jobs
+        # Process shot-specific jobs (GROUP BY SHOT, not by artist)
+        processed_shots = set()
+
         for shot in sg_state['shots']:
             project_tank = shot['project']['tank_name']
             shot_code = shot['code']
             sequence = shot['sequence']
 
-            for artist in shot['assigned_artists']:
-                if artist not in artist_agents:
-                    logger.info(f"Artist {artist} not in config, skipping")
+            # Skip if we already processed this shot
+            shot_key = f"{project_tank}_{shot_code}"
+            if shot_key in processed_shots:
+                continue
+            processed_shots.add(shot_key)
+
+            # Get all valid artists for this shot
+            valid_artists = [
+                artist for artist in shot['assigned_artists']
+                if artist in self.config.get("target_agents", {})
+            ]
+
+            if not valid_artists:
+                logger.info(f"No valid artists configured for shot {shot_code}, skipping")
+                continue
+
+            try:
+                # Build primary storage path (shared by all artists)
+                primary_path = self.build_primary_storage_path(project_tank, sequence, shot_code)
+
+                # Build end-user agents array
+                end_user_agents = []
+                for artist in valid_artists:
+                    target_agent_id = self.get_target_agent_id(api, artist)
+                    target_path = self.build_target_agent_path(artist, project_tank, sequence, shot_code)
+
+                    end_user_agents.append({
+                        'id': target_agent_id,
+                        'role': 'enduser',
+                        'permission': 'srw',
+                        'file_policy_id': 1,
+                        'path': {
+                            'linux': target_path,
+                            'win': target_path.replace('/', '\\'),
+                            'osx': target_path
+                        }
+                    })
+
+                # Job name without artist names
+                job_name = f"HybridWork_{project_tank}_{shot_code}"
+
+                # Check if job exists
+                existing_jobs = api.find_jobs_by_pattern(job_name)
+
+                if existing_jobs:
+                    # Update existing job (complex - would need to compare agents)
+                    logger.info(f"Job {job_name} already exists, skipping update for now")
                     continue
+                else:
+                    # Create new job with all artists as end users
+                    job_attrs = {
+                        'name': job_name,
+                        'type': 'hybrid_work',
+                        'description': f"Shot {shot_code} for: {', '.join(valid_artists)}",
+                        'agents': [
+                            {
+                                'id': primary_storage_agent_id,
+                                'role': 'primary_storage',
+                                'permission': 'rw',
+                                'priority_agents': True,
+                                'path': {
+                                    'linux': primary_path,
+                                    'win': primary_path.replace('/', '\\'),
+                                    'osx': primary_path
+                                }
+                            }
+                        ] + end_user_agents
+                    }
 
-                agent_name = artist_agents[artist]
-                agent = api.find_agent_by_name(agent_name)
+                    job_id = api._create_job(job_attrs, ignore_errors=True)
+                    results['shot_jobs_created'] += 1
+                    results['artists_processed'].update(valid_artists)
 
-                if not agent:
-                    error_msg = f"Agent {agent_name} for artist {artist} not found in Resilio"
-                    logger.warning(error_msg)
-                    results['errors'].append(error_msg)
-                    continue
-
-                try:
-                    # Generate paths and job names
-                    shot_path = self.build_shot_path(project_tank, sequence, shot_code)
-                    job_name = self.generate_job_names(artist, project_tank, shot_code)
-
-                    # Check if job exists
-                    existing_jobs = api.find_jobs_by_pattern(job_name)
-
-                    if existing_jobs:
-                        # Update existing job
-                        job = existing_jobs[0]
-                        job_id = job['id']
-                        api.update_job_path(job_id, shot_path)
-                        results['shot_jobs_updated'] += 1
-                        action = 'updated'
-                    else:
-                        # Create new job
-                        job_result = api.create_hybrid_work_job(
-                            name=job_name,
-                            agent_id=agent['id'],
-                            path=shot_path,
-                            description=f"Shot {shot_code} for {artist}"
-                        )
-                        job_id = job_result['id']
-                        results['shot_jobs_created'] += 1
-                        action = 'created'
-
-                    # Start job and hydrate shot folder
-                    active_run = api.get_active_run_for_job(job_id)
-                    if not active_run:
-                        run_id = api.start_job(job_id)
-                    else:
-                        run_id = active_run['id']
-
-                    # Hydrate the shot folder
-                    hydrate_result = api.hydrate_files(
-                        run_id=run_id,
-                        files=[shot_path],
-                        agents=[agent['id']]
-                    )
-
-                    success_count = sum(1 for a in hydrate_result.get("agents", [])
-                                      if a.get("status") == "sent")
-                    if success_count > 0:
-                        results['shot_jobs_hydrated'] += 1
-
-                    results['artists_processed'].add(artist)
                     results['details'].append({
                         'type': 'shot',
-                        'artist': artist,
+                        'artists': valid_artists,
                         'project': project_tank,
                         'shot': shot_code,
                         'job_name': job_name,
-                        'path': shot_path,
-                        'action': action,
-                        'hydrated': success_count > 0
+                        'primary_path': primary_path,
+                        'action': 'created'
                     })
 
-                except Exception as e:
-                    error_msg = f"Failed to process shot job for {artist}/{shot_code}: {e}"
-                    logger.error(error_msg)
-                    results['errors'].append(error_msg)
+            except Exception as e:
+                error_msg = f"Failed to process shot job for {shot_code}: {e}"
+                logger.error(error_msg)
+                results['errors'].append(error_msg)
 
-        # Process assets jobs (one per artist per project)
+        # Process assets jobs (ONE JOB PER PROJECT with multiple artists)
+        processed_asset_projects = set()
+
         for artist, projects in sg_state['artist_projects'].items():
-            if artist not in artist_agents:
-                continue
-
-            agent_name = artist_agents[artist]
-            agent = api.find_agent_by_name(agent_name)
-
-            if not agent:
+            if artist not in self.config.get("target_agents", {}):
                 continue
 
             for project_tank in projects:
+                # Skip if we already processed this project's assets
+                if project_tank in processed_asset_projects:
+                    continue
+
+                # Get all artists working on this project
+                project_artists = [
+                    a for a, projs in sg_state['artist_projects'].items()
+                    if project_tank in projs and a in self.config.get("target_agents", {})
+                ]
+
+                if not project_artists:
+                    continue
+
+                processed_asset_projects.add(project_tank)
+
                 try:
-                    assets_path = self.build_assets_path(project_tank)
-                    job_name = self.generate_job_names(artist, project_tank)
+                    # Build primary assets path (shared by all artists)
+                    primary_assets_path = self.build_primary_assets_path(project_tank)
+
+                    # Build end-user agents array for assets
+                    asset_end_user_agents = []
+                    for project_artist in project_artists:
+                        target_agent_id = self.get_target_agent_id(api, project_artist)
+                        target_assets_path = self.build_target_assets_path(project_artist, project_tank)
+
+                        asset_end_user_agents.append({
+                            'id': target_agent_id,
+                            'role': 'enduser',
+                            'permission': 'srw',
+                            'file_policy_id': 1,
+                            'path': {
+                                'linux': target_assets_path,
+                                'win': target_assets_path.replace('/', '\\'),
+                                'osx': target_assets_path
+                            }
+                        })
+
+                    # Assets job name without artist names
+                    assets_job_name = f"HybridWork_{project_tank}_Assets"
 
                     # Check if assets job exists
-                    existing_jobs = api.find_jobs_by_pattern(job_name)
+                    existing_jobs = api.find_jobs_by_pattern(assets_job_name)
 
                     if existing_jobs:
-                        # Update existing assets job
-                        job = existing_jobs[0]
-                        job_id = job['id']
-                        api.update_job_path(job_id, assets_path)
-                        results['assets_jobs_updated'] += 1
-                        action = 'updated'
+                        logger.info(f"Assets job {assets_job_name} already exists, skipping update for now")
+                        continue
                     else:
-                        # Create new assets job
-                        job_result = api.create_hybrid_work_job(
-                            name=job_name,
-                            agent_id=agent['id'],
-                            path=assets_path,
-                            description=f"Assets for {project_tank} - {artist}"
-                        )
-                        results['assets_jobs_created'] += 1
-                        action = 'created'
+                        # Create new assets job with all artists as end users
+                        assets_job_attrs = {
+                            'name': assets_job_name,
+                            'type': 'hybrid_work',
+                            'description': f"Assets for {project_tank} - Artists: {', '.join(project_artists)}",
+                            'agents': [
+                                {
+                                    'id': primary_storage_agent_id,
+                                    'role': 'primary_storage',
+                                    'permission': 'rw',
+                                    'priority_agents': True,
+                                    'path': {
+                                        'linux': primary_assets_path,
+                                        'win': primary_assets_path.replace('/', '\\'),
+                                        'osx': primary_assets_path
+                                    }
+                                }
+                            ] + asset_end_user_agents
+                        }
 
-                    results['details'].append({
-                        'type': 'assets',
-                        'artist': artist,
-                        'project': project_tank,
-                        'job_name': job_name,
-                        'path': assets_path,
-                        'action': action,
-                        'hydrated': False  # No hydration for assets
-                    })
+                        assets_job_id = api._create_job(assets_job_attrs, ignore_errors=True)
+                        results['assets_jobs_created'] += 1
+                        results['artists_processed'].update(project_artists)
+
+                        results['details'].append({
+                            'type': 'assets',
+                            'artists': project_artists,
+                            'project': project_tank,
+                            'job_name': assets_job_name,
+                            'primary_path': primary_assets_path,
+                            'action': 'created'
+                        })
 
                 except Exception as e:
-                    error_msg = f"Failed to process assets job for {artist}/{project_tank}: {e}"
+                    error_msg = f"Failed to process assets job for project {project_tank}: {e}"
                     logger.error(error_msg)
                     results['errors'].append(error_msg)
+
 
         # Convert set to count for JSON serialization
         results['artists_processed'] = len(results['artists_processed'])

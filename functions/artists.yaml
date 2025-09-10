@@ -1,45 +1,30 @@
-# Artist configuration for Resilio Connect state synchronization
-# Updated for comprehensive ShotGrid-Resilio sync
+# Primary storage configuration - where master files live
+primary_storage:
+  agent_name: "Linux_Remote"
+  agent_id: 4
+  base_path: "/home/Company"
 
-artists:
-  # Maps ShotGrid artist names to Resilio agent names
-  Galactus: Linux_02
-  Doom: Linux_03
+# Target agents - where files sync to
+target_agents:
+  Matthew Testuser:
+    agent_name: "Cameron's Mac mini"
+    agent_id: 3
+    base_path: "/Volumes/Company"
+  Alex Trial:
+    agent_name: "Cameron's MacBook Pro"
+    agent_id: 2
+    base_path: "/Volumes/Company"
 
-# Path templates for hybrid work jobs
-paths:
-  # Template for shot-specific paths
-  # Tokens: ${PROJECT} = tank_name, ${SEQUENCE} = sequence, ${SHOT} = shot code
-  shots_template: "/Volumes/Company/${PROJECT}/2_WORK/1_SEQUENCES/${SEQUENCE}/${SHOT}"
+# Path templates - relative structure that gets replicated
+path_templates:
+  # Shot-specific paths (relative to base_path)
+  shots_template: "${PROJECT}/2_WORK/1_SEQUENCES/${SEQUENCE}/${SHOT}"
 
-  # Template for assets paths
-  # Tokens: ${PROJECT} = tank_name
-  assets_template: "/Volumes/Company/${PROJECT}/2_WORK/2_ASSETS"
+  # Assets paths (relative to base_path)
+  assets_template: "${PROJECT}/2_WORK/2_ASSETS"
 
-# Job naming patterns (used for finding/creating jobs)
-job_patterns:
-  # Shot jobs: HybridWork_ArtistName_ProjectTank_ShotName
-  shot_job: "HybridWork_${ARTIST}_${PROJECT}_${SHOT}"
-
-  # Assets jobs: HybridWork_ArtistName_ProjectTank_Assets
-  assets_job: "HybridWork_${ARTIST}_${PROJECT}_Assets"
-
-# Sync settings
-sync_settings:
-  # Only sync shots with this status
-  active_shot_status: "active"
-
-  # Whether to delete jobs for shots that are no longer active
-  cleanup_inactive_jobs: true
-
-  # Maximum files to hydrate per request
-  max_hydrate_files: 1000
-
-# Legacy settings (for backward compatibility)
-defaults:
+# Job settings
+job_settings:
+  auto_create_paths: true
+  folder_permissions: "755"
   sync_direction: "bidirectional"
-  profile_id: null
-  priority: "normal"
-  ignore_patterns:
-    - ".DS_Store"
-    - "Thumbs.db"

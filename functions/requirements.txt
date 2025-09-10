@@ -1,6 +1,5 @@
 firebase_functions~=0.1.0
 functions-framework==3.*
 shotgun_api3
-six>=1.10.0
 requests
 PyYAML
