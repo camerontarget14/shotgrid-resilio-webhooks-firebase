@@ -1,7 +1,7 @@
 
 # ShotGrid-Resilio Webhooks Integration
 
-Automated synchronization system that keeps Resilio Connect hybrid work jobs connected to ShotGrid shot statuses and task assignments.
+Automated system that keeps Resilio Active Everywhere hybrid work jobs connected to ShotGrid shot statuses and task assignments.
 
 ## Overview
 
