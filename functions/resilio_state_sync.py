@@ -175,6 +175,68 @@ class ResilioStateAPI(ApiBaseCommands):
         except ApiError as e:
             raise ApiError(f"Failed to start job {job_id}: {e}")
 
+    def get_all_hybrid_work_jobs(self) -> List[Dict[str, Any]]:
+        """Get all HybridWork jobs managed by this system."""
+        try:
+            all_jobs = self._get_jobs()
+            hybrid_jobs = []
+
+            for job in all_jobs:
+                job_name = job.get("name", "")
+                if job_name.startswith("HybridWork_"):
+                    hybrid_jobs.append(job)
+
+            return hybrid_jobs
+        except ApiError as e:
+            logger.error(f"Failed to get hybrid work jobs: {e}")
+            return []
+
+    def compare_job_agents(self, job: Dict[str, Any], expected_agents: List[Dict[str, Any]]) -> bool:
+        """Compare if a job's agents match the expected configuration."""
+        current_agents = job.get("agents", [])
+
+        # Sort both lists by agent ID for comparison
+        current_enduser_agents = sorted([
+            agent for agent in current_agents
+            if agent.get("role") == "enduser"
+        ], key=lambda x: x.get("id", 0))
+
+        expected_enduser_agents = sorted([
+            agent for agent in expected_agents
+            if agent.get("role") == "enduser"
+        ], key=lambda x: x.get("id", 0))
+
+        # Compare agent IDs
+        current_ids = {agent.get("id") for agent in current_enduser_agents}
+        expected_ids = {agent.get("id") for agent in expected_enduser_agents}
+
+        return current_ids == expected_ids
+
+    def update_job_agents(self, job_id: int, job_name: str, expected_agents: List[Dict[str, Any]]) -> bool:
+        """Update a job's agents to match expected configuration."""
+        try:
+            # Get current job configuration
+            job = self._get_job(job_id)
+
+            # Remove read-only properties
+            read_only_props = ['total_transferred', 'created_at', 'created_by', 'last_start_time', 'errors', 'access', 'notifications']
+            for prop in read_only_props:
+                job.pop(prop, None)
+
+            # Update agents
+            job['agents'] = expected_agents
+
+            # Update the job
+            self._update_job(job_id, job)
+            logger.info(f"Updated job '{job_name}' agents")
+            return True
+
+        except ApiError as e:
+            logger.error(f"Failed to update job '{job_name}': {e}")
+            return False
+
+
+
 class ShotGridStateManager:
     """Manages querying ShotGrid for current assignment and shot state."""
 
@@ -402,9 +464,16 @@ class ResilioStateSyncManager:
             return f"HybridWork_{artist}_{project}_Assets"
 
     def sync_resilio_to_shotgrid_state(self, sg_state: Dict[str, Any],
-                                     resilio_url: str, resilio_token: str) -> Dict[str, Any]:
+                                        resilio_url: str, resilio_token: str) -> Dict[str, Any]:
         """
-        Synchronize Resilio jobs to match ShotGrid state.
+        Completely synchronize Resilio jobs to match ShotGrid state.
+
+        This method:
+        1. Gets all existing HybridWork jobs
+        2. Determines what jobs should exist based on ShotGrid state
+        3. Creates missing jobs
+        4. Updates jobs with changed assignments
+        5. Removes jobs that should no longer exist
 
         Args:
             sg_state: Output from ShotGridStateManager.get_active_shots_with_assignments()
@@ -423,10 +492,10 @@ class ResilioStateSyncManager:
             return {
                 'shot_jobs_created': 0,
                 'shot_jobs_updated': 0,
-                'shot_jobs_hydrated': 0,
+                'shot_jobs_deleted': 0,
                 'assets_jobs_created': 0,
                 'assets_jobs_updated': 0,
-                'artists_processed': 0,
+                'assets_jobs_deleted': 0,
                 'errors': [f"Failed to get primary storage agent: {e}"],
                 'details': []
             }
@@ -434,17 +503,25 @@ class ResilioStateSyncManager:
         results = {
             'shot_jobs_created': 0,
             'shot_jobs_updated': 0,
-            'shot_jobs_hydrated': 0,
+            'shot_jobs_deleted': 0,
             'assets_jobs_created': 0,
             'assets_jobs_updated': 0,
+            'assets_jobs_deleted': 0,
             'artists_processed': set(),
             'errors': [],
             'details': []
         }
 
-        # Process shot-specific jobs (GROUP BY SHOT, not by artist)
-        processed_shots = set()
+        # Step 1: Get all existing HybridWork jobs
+        existing_jobs = api.get_all_hybrid_work_jobs()
+        logger.info(f"Found {len(existing_jobs)} existing HybridWork jobs")
 
+        # Step 2: Build expected job configurations
+        expected_shot_jobs = {}  # job_name -> job_config
+        expected_assets_jobs = {}  # job_name -> job_config
+
+        # Build shot job configurations
+        processed_shots = set()
         for shot in sg_state['shots']:
             project_tank = shot['project']['tank_name']
             shot_code = shot['code']
@@ -463,11 +540,12 @@ class ResilioStateSyncManager:
             ]
 
             if not valid_artists:
-                logger.info(f"No valid artists configured for shot {shot_code}, skipping")
+                logger.info(f"No valid artists configured for shot {shot_code}, will remove any existing jobs")
                 continue
 
             try:
-                # Build primary storage path (shared by all artists)
+                # Build job configuration
+                job_name = f"HybridWork_{project_tank}_{shot_code}"
                 primary_path = self.build_primary_storage_path(project_tank, sequence, shot_code)
 
                 # Build end-user agents array
@@ -488,59 +566,41 @@ class ResilioStateSyncManager:
                         }
                     })
 
-                # Job name without artist names
-                job_name = f"HybridWork_{project_tank}_{shot_code}"
-
-                # Check if job exists
-                existing_jobs = api.find_jobs_by_pattern(job_name)
-
-                if existing_jobs:
-                    # Update existing job (complex - would need to compare agents)
-                    logger.info(f"Job {job_name} already exists, skipping update for now")
-                    continue
-                else:
-                    # Create new job with all artists as end users
-                    job_attrs = {
-                        'name': job_name,
-                        'type': 'hybrid_work',
-                        'description': f"Shot {shot_code} for: {', '.join(valid_artists)}",
-                        'agents': [
-                            {
-                                'id': primary_storage_agent_id,
-                                'role': 'primary_storage',
-                                'permission': 'rw',
-                                'priority_agents': True,
-                                'path': {
-                                    'linux': primary_path,
-                                    'win': primary_path.replace('/', '\\'),
-                                    'osx': primary_path
-                                }
-                            }
-                        ] + end_user_agents
+                # Full agent configuration
+                full_agents = [
+                    {
+                        'id': primary_storage_agent_id,
+                        'role': 'primary_storage',
+                        'permission': 'rw',
+                        'priority_agents': True,
+                        'path': {
+                            'linux': primary_path,
+                            'win': primary_path.replace('/', '\\'),
+                            'osx': primary_path
+                        }
                     }
+                ] + end_user_agents
 
-                    job_id = api._create_job(job_attrs, ignore_errors=True)
-                    results['shot_jobs_created'] += 1
-                    results['artists_processed'].update(valid_artists)
+                expected_shot_jobs[job_name] = {
+                    'name': job_name,
+                    'type': 'shot',
+                    'artists': valid_artists,
+                    'project': project_tank,
+                    'shot': shot_code,
+                    'primary_path': primary_path,
+                    'agents': full_agents,
+                    'description': f"Shot {shot_code} for: {', '.join(valid_artists)}"
+                }
 
-                    results['details'].append({
-                        'type': 'shot',
-                        'artists': valid_artists,
-                        'project': project_tank,
-                        'shot': shot_code,
-                        'job_name': job_name,
-                        'primary_path': primary_path,
-                        'action': 'created'
-                    })
+                results['artists_processed'].update(valid_artists)
 
             except Exception as e:
-                error_msg = f"Failed to process shot job for {shot_code}: {e}"
+                error_msg = f"Failed to build shot job config for {shot_code}: {e}"
                 logger.error(error_msg)
                 results['errors'].append(error_msg)
 
-        # Process assets jobs (ONE JOB PER PROJECT with multiple artists)
+        # Build assets job configurations
         processed_asset_projects = set()
-
         for artist, projects in sg_state['artist_projects'].items():
             if artist not in self.config.get("target_agents", {}):
                 continue
@@ -562,7 +622,7 @@ class ResilioStateSyncManager:
                 processed_asset_projects.add(project_tank)
 
                 try:
-                    # Build primary assets path (shared by all artists)
+                    job_name = f"HybridWork_{project_tank}_Assets"
                     primary_assets_path = self.build_primary_assets_path(project_tank)
 
                     # Build end-user agents array for assets
@@ -583,56 +643,157 @@ class ResilioStateSyncManager:
                             }
                         })
 
-                    # Assets job name without artist names
-                    assets_job_name = f"HybridWork_{project_tank}_Assets"
-
-                    # Check if assets job exists
-                    existing_jobs = api.find_jobs_by_pattern(assets_job_name)
-
-                    if existing_jobs:
-                        logger.info(f"Assets job {assets_job_name} already exists, skipping update for now")
-                        continue
-                    else:
-                        # Create new assets job with all artists as end users
-                        assets_job_attrs = {
-                            'name': assets_job_name,
-                            'type': 'hybrid_work',
-                            'description': f"Assets for {project_tank} - Artists: {', '.join(project_artists)}",
-                            'agents': [
-                                {
-                                    'id': primary_storage_agent_id,
-                                    'role': 'primary_storage',
-                                    'permission': 'rw',
-                                    'priority_agents': True,
-                                    'path': {
-                                        'linux': primary_assets_path,
-                                        'win': primary_assets_path.replace('/', '\\'),
-                                        'osx': primary_assets_path
-                                    }
-                                }
-                            ] + asset_end_user_agents
+                    # Full agent configuration for assets
+                    full_assets_agents = [
+                        {
+                            'id': primary_storage_agent_id,
+                            'role': 'primary_storage',
+                            'permission': 'rw',
+                            'priority_agents': True,
+                            'path': {
+                                'linux': primary_assets_path,
+                                'win': primary_assets_path.replace('/', '\\'),
+                                'osx': primary_assets_path
+                            }
                         }
+                    ] + asset_end_user_agents
 
-                        assets_job_id = api._create_job(assets_job_attrs, ignore_errors=True)
-                        results['assets_jobs_created'] += 1
-                        results['artists_processed'].update(project_artists)
+                    expected_assets_jobs[job_name] = {
+                        'name': job_name,
+                        'type': 'assets',
+                        'artists': project_artists,
+                        'project': project_tank,
+                        'primary_path': primary_assets_path,
+                        'agents': full_assets_agents,
+                        'description': f"Assets for {project_tank} - Artists: {', '.join(project_artists)}"
+                    }
 
-                        results['details'].append({
-                            'type': 'assets',
-                            'artists': project_artists,
-                            'project': project_tank,
-                            'job_name': assets_job_name,
-                            'primary_path': primary_assets_path,
-                            'action': 'created'
-                        })
+                    results['artists_processed'].update(project_artists)
 
                 except Exception as e:
-                    error_msg = f"Failed to process assets job for project {project_tank}: {e}"
+                    error_msg = f"Failed to build assets job config for project {project_tank}: {e}"
                     logger.error(error_msg)
                     results['errors'].append(error_msg)
 
+        # Step 3: Process existing jobs
+        all_expected_jobs = {**expected_shot_jobs, **expected_assets_jobs}
+        existing_job_names = {job.get('name'): job for job in existing_jobs}
+
+        # Jobs to delete (exist but not expected)
+        jobs_to_delete = set(existing_job_names.keys()) - set(all_expected_jobs.keys())
+
+        # Jobs to create (expected but don't exist)
+        jobs_to_create = set(all_expected_jobs.keys()) - set(existing_job_names.keys())
+
+        # Jobs to potentially update (exist and expected)
+        jobs_to_check_update = set(all_expected_jobs.keys()) & set(existing_job_names.keys())
+
+        logger.info(f"Jobs to delete: {len(jobs_to_delete)}, create: {len(jobs_to_create)}, check for updates: {len(jobs_to_check_update)}")
+
+        # Step 4: Delete jobs that should no longer exist
+        for job_name in jobs_to_delete:
+            try:
+                existing_job = existing_job_names[job_name]
+                job_id = existing_job.get('id')
+
+                logger.info(f"Deleting job: {job_name}")
+                api._delete_job(job_id)
+
+                # Determine type for counting
+                if '_Assets' in job_name:
+                    results['assets_jobs_deleted'] += 1
+                else:
+                    results['shot_jobs_deleted'] += 1
+
+                results['details'].append({
+                    'type': 'assets' if '_Assets' in job_name else 'shot',
+                    'job_name': job_name,
+                    'action': 'deleted',
+                    'reason': 'no_longer_needed'
+                })
+
+            except Exception as e:
+                error_msg = f"Failed to delete job {job_name}: {e}"
+                logger.error(error_msg)
+                results['errors'].append(error_msg)
+
+        # Step 5: Create missing jobs
+        for job_name in jobs_to_create:
+            try:
+                job_config = all_expected_jobs[job_name]
+
+                logger.info(f"Creating job: {job_name}")
+
+                job_attrs = {
+                    'name': job_config['name'],
+                    'type': 'hybrid_work',
+                    'description': job_config['description'],
+                    'agents': job_config['agents']
+                }
+
+                job_id = api._create_job(job_attrs, ignore_errors=True)
+
+                # Determine type for counting
+                if job_config['type'] == 'assets':
+                    results['assets_jobs_created'] += 1
+                else:
+                    results['shot_jobs_created'] += 1
+
+                results['details'].append({
+                    'type': job_config['type'],
+                    'artists': job_config['artists'],
+                    'project': job_config['project'],
+                    'shot': job_config.get('shot'),
+                    'job_name': job_name,
+                    'primary_path': job_config['primary_path'],
+                    'action': 'created'
+                })
+
+            except Exception as e:
+                error_msg = f"Failed to create job {job_name}: {e}"
+                logger.error(error_msg)
+                results['errors'].append(error_msg)
+
+        # Step 6: Update jobs with changed assignments
+        for job_name in jobs_to_check_update:
+            try:
+                existing_job = existing_job_names[job_name]
+                expected_config = all_expected_jobs[job_name]
+                job_id = existing_job.get('id')
+
+                # Compare agent configurations
+                if not api.compare_job_agents(existing_job, expected_config['agents']):
+                    logger.info(f"Updating job agents: {job_name}")
+
+                    if api.update_job_agents(job_id, job_name, expected_config['agents']):
+                        # Determine type for counting
+                        if expected_config['type'] == 'assets':
+                            results['assets_jobs_updated'] += 1
+                        else:
+                            results['shot_jobs_updated'] += 1
+
+                        results['details'].append({
+                            'type': expected_config['type'],
+                            'artists': expected_config['artists'],
+                            'project': expected_config['project'],
+                            'shot': expected_config.get('shot'),
+                            'job_name': job_name,
+                            'action': 'updated',
+                            'reason': 'agent_assignments_changed'
+                        })
+                else:
+                    logger.debug(f"Job {job_name} is up to date")
+
+            except Exception as e:
+                error_msg = f"Failed to update job {job_name}: {e}"
+                logger.error(error_msg)
+                results['errors'].append(error_msg)
 
         # Convert set to count for JSON serialization
         results['artists_processed'] = len(results['artists_processed'])
+
+        logger.info(f"Sync complete - Created: {results['shot_jobs_created']} shot, {results['assets_jobs_created']} assets | "
+                    f"Updated: {results['shot_jobs_updated']} shot, {results['assets_jobs_updated']} assets | "
+                    f"Deleted: {results['shot_jobs_deleted']} shot, {results['assets_jobs_deleted']} assets")
 
         return results

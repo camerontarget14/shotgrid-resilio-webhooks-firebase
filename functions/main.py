@@ -274,9 +274,10 @@ def _handle_shot_status(payload: dict):
         # Log summary
         logger.info(f"Sync complete: {sync_results['shot_jobs_created']} shot jobs created, "
                    f"{sync_results['shot_jobs_updated']} updated, "
-                   f"{sync_results['shot_jobs_hydrated']} hydrated, "
+                   f"{sync_results['shot_jobs_deleted']} deleted, "
                    f"{sync_results['assets_jobs_created']} assets jobs created, "
-                   f"{sync_results['assets_jobs_updated']} assets updated")
+                   f"{sync_results['assets_jobs_updated']} assets updated, "
+                   f"{sync_results['assets_jobs_deleted']} assets deleted")
 
         if sync_results['errors']:
             logger.warning(f"Sync completed with {len(sync_results['errors'])} errors")
