@@ -7,7 +7,7 @@ Automated system that keeps Resilio Active Everywhere hybrid work jobs connected
 
 This Firebase Cloud Function service monitors ShotGrid webhooks and automatically manages Resilio Connect jobs to ensure artists have access to the right files at the right time. When shots become active or artists are assigned/removed, the system creates, updates, or deletes Resilio HybridWork jobs accordingly.
 
-![shotsmappedtojobs](https://bucket.camerontarget.com/resilio_run_through/shotmappedtojob.png)
+![shotsmappedtojobs](https://bucket.camerontarget.com/resilio_run_through/workflow.gif)
 
 ## Features
 
